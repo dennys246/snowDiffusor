@@ -1,4 +1,4 @@
-import os, atexit, argparse, shutil, re, cv2, torch
+import os, atexit, argparse, shutil, re, cv2, torch, argparse
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -34,6 +34,8 @@ class snowDiffusor(nn.Module):
     def __init__(self, path = 'snowdiffusor/', resolution = (1024, 1024), new = False):
         super().__init__()
 
+        self.data_directory = '/Users/dennyschaedig/Scripts/AvalancheAI/snow-profiles/magnified-profiles'
+
         # Check if model folder rebuilt requested
         if new and os.path.exists(path):
             # Double check with user model is to be rebuilt
@@ -48,18 +50,11 @@ class snowDiffusor(nn.Module):
         if not os.path.exists(self.path):
             os.makedirs(f"{self.path}synthetic_images/", exist_ok = True)
 
-        # Initialize pipeline and the generator/discriminator
-        self.pipe = pipeline(self.path, self.resolution)
-        self.loss = []
-
-        # Create a noise schedule to follow
-        self.schedule_noise()
-
         # Check if model could be loaded
         if path and new == False:
             if os.path.exists(f"{self.path}diffusor.keras"):
                 self.load_model()
-
+        
         # Define training runtime parameters
         self.resolution = resolution # Resolution to resample images to
         self.batch_size = 8 # Number of images to load in per training batch
@@ -67,6 +62,19 @@ class snowDiffusor(nn.Module):
         self.synthetics = 10 # Number of synthetic images to generate after training
 
         self.t = 1000  # total diffusion steps
+
+        # Initialize data loader
+        self.dataloader = self.load(resolution)
+
+        # Initialize pipeline and the generator/discriminator
+        self.pipe = pipeline(self.path, self.resolution)
+        self.loss = []
+
+        # Create a noise schedule to follow
+        self.schedule_noise()
+
+        self.build()
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
 
         atexit.register(self.save_model)
         return
@@ -97,14 +105,14 @@ class snowDiffusor(nn.Module):
 
         self.final = nn.Conv2d(in_channels, out_channels, 1)
 
-    def load(self, data_folder):
+    def load(self, resolution):
         transform = transforms.Compose([
-            transforms.Resize((1024, 1024)),
+            transforms.Resize(resolution),
             transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),  # Scale to [-1, 1], common in diffusion
+            transforms.Normalize([0.5] * 3, [0.5] * 3),  # Scale to [-1, 1], common in diffusion
         ])
 
-        dataset = ImageFolder(root = data_folder, transform = transform)
+        dataset = ImageFolder(root = self.data_directory, transform = transform)
         dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
         return dataloader
 
@@ -116,7 +124,7 @@ class snowDiffusor(nn.Module):
             x = F.avg_pool2d(x, 2)
 
         for up in self.ups:
-            x = F.interpolate(x, scale_factor=2, mode='nearest')
+            x = F.interpolate(x, scale_factor = 2, mode = 'nearest')
             skip_x = skip_connections.pop()
             
             x = torch.cat((x, skip_x), dim=1)
@@ -141,36 +149,54 @@ class snowDiffusor(nn.Module):
         sqrt_one_minus_alphas_cumprod_t = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None, None]
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def train(self, model, dataloader, optimizer, device):
-        model.train()
+    def train_model(self, device = 'cuda'):
+        self.train()  # set model to training mode
         scaler = torch.cuda.amp.GradScaler()
-        with torch.cuda.amp.autocast():
-            for x in dataloader:
+
+        for epoch in range(self.epochs):
+            for batch in self.dataloader:
+                x, _ = batch  # if using ImageFolder, this returns (image, label)
                 x = x.to(device)
-                t = torch.randint(0, self.t, (x.size(0),), device=device).long()
+                t = torch.randint(0, self.t, (x.size(0), ), device = device).long()
                 noise = torch.randn_like(x)
                 x_noisy = self.q_sample(x, t, noise)
-                noise_pred = model(x_noisy, t)
-                loss = F.mse_loss(noise_pred, noise)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+
+                with torch.cuda.amp.autocast():
+                    noise_pred = self(x_noisy, t)  # 🔥 use self for forward pass
+                    loss = F.mse_loss(noise_pred, noise)
+
+                self.optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+
+            print(f"[Epoch {epoch+1}/{self.epochs}] Loss: {loss.item():.4f}")
+            self.loss.append(loss.item())
 
     @torch.no_grad()
-    def sample(self, model, image_size, batch_size=16, channels=3):
-        model.eval()
+    def generate(self, batch_size=16, channels=3, device='cuda'):
+        self.eval()
+
+        image_size = self.resolution
+
         x = torch.randn((batch_size, channels, image_size, image_size)).to(device)
 
         for t in reversed(range(self.t)):
-            t_batch = torch.full((batch_size,), t, dtype=torch.long)
-            predicted_noise = model(x, t_batch)
-            beta_t = self.betas[t]
-            alpha_t = self.alphas[t]
-            alpha_cumprod_t = self.alphas_cumprod[t]
-            alpha_cumprod_t_prev = self.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0)
+            t_batch = torch.full((batch_size,), t, dtype = torch.long, device=device)
 
-            coef1 = (1 / torch.sqrt(alpha_t)) * (x - beta_t / torch.sqrt(1 - alpha_cumprod_t) * predicted_noise)
+            predicted_noise = self(x, t_batch)
+
+            beta_t = self.betas[t].to(device)
+            alpha_t = self.alphas[t].to(device)
+            alpha_cumprod_t = self.alphas_cumprod[t].to(device)
+            alpha_cumprod_t_prev = (
+                self.alphas_cumprod[t - 1].to(device) if t > 0 else torch.tensor(1.0, device = device)
+            )
+
+            coef1 = (1 / torch.sqrt(alpha_t)) * (
+                x - (beta_t / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise
+            )
+
             if t > 0:
                 noise = torch.randn_like(x)
                 coef2 = torch.sqrt(1 - alpha_cumprod_t_prev)
@@ -190,3 +216,29 @@ class snowDiffusor(nn.Module):
     def load_model(self):
         self.load_state_dict(torch.load(os.path.join(self.path, "diffusor.pth")))
     
+if __name__ == "__main__": # Add in command line functionality
+
+    # Initialize the parser for accepting arugments into a command line call
+    parser = argparse.ArgumentParser(description = "The snowDiffusor model is used to train a PyTorch based Diffusor model on a dataset of snow samples magnified on a crystal card. You can define how the model runs by the number of epochs, batch sizes and other parameters. You can also pass in a path to a pre-trained snowDiffusor to accomplish transfer learning on new Diffusion tasks!")
+
+    # Add command-line arguments
+    parser.add_argument('--path', type = str, default = "snowdiffusor/", help = "Path to a pre-trained model or directory to save results (defaults to snowgan/)")
+    parser.add_argument('--resolution', type = set, default = (1024, 1024), help = 'Resolution to downsample images too (Default set to (1024, 1024))')
+    parser.add_argument('--batches', type = int, default = None, help = 'Number of batches to run (Default to max available)')
+    parser.add_argument('--batch-size', type = int, default = 8, help = 'Batch size (Defaults to 8)')
+    parser.add_argument('--epochs', type = int, default = 100, help = 'Training epochs per image (Defaults to 100)')
+    parser.add_argument('--new', type = bool, default = False, help = 'Whether to rebuild model from scratch (defaults to False)')
+
+    # Parse the arguments
+    args = parser.parse_args()
+
+    # Create the snowGAN object with the parsed arguments
+    snowdiff = snowDiffusor(path = args.path, resolution = args.resolution, new = args.new)
+    snowdiff.batch_size = args.batch_size
+    snowdiff.epochs = args.epochs
+
+    # Train the model
+    snowdiff.train()
+
+    # Generate a final batch of images for viewing
+    snowdiff.generate()
