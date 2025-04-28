@@ -10,8 +10,6 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 
-
-
 class snowDiffusor(nn.Module):
 
     """
@@ -31,7 +29,7 @@ class snowDiffusor(nn.Module):
     
     """
 
-    def __init__(self, path = 'snowdiffusor/', resolution = (1024, 1024), new = False):
+    def __init__(self, path = 'snowdiffusor/', resolution = (512, 512), new = False):
         super().__init__()
 
         self.data_directory = '/Users/dennyschaedig/Scripts/AvalancheAI/snow-profiles/magnified-profiles'
@@ -57,7 +55,7 @@ class snowDiffusor(nn.Module):
         
         # Define training runtime parameters
         self.resolution = resolution # Resolution to resample images to
-        self.batch_size = 8 # Number of images to load in per training batch
+        self.batch_size = 1 # Number of images to load in per training batch
         self.epochs = 50 # Number of training epochs per training batch
         self.synthetics = 10 # Number of synthetic images to generate after training
 
@@ -67,43 +65,77 @@ class snowDiffusor(nn.Module):
         self.dataloader = self.load(resolution)
 
         # Initialize pipeline and the generator/discriminator
-        self.pipe = pipeline(self.path, self.resolution)
+        #self.pipe = pipeline(self.path, self.resolution)
         self.loss = []
 
         # Create a noise schedule to follow
         self.schedule_noise()
 
         self.build()
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr = 1e-4)
+
+        torch.no_grad()
 
         atexit.register(self.save_model)
+        device = torch.device("mps")  # Use MPS device
+        self.to(device)
         return
 
-    def build(self, in_channels = 3, out_channels = 3, features = [64, 128, 256, 512, 1024, 1024]):
+    def build(self, in_channels = 3, out_channels = 3, features = [4, 8, 16, 32]):
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
-        
-        # Down sampling
-        for feature in features:
+
+        def get_num_groups(num_channels, divisor = 32):
+            for g in reversed(range(1, divisor + 1)):
+                if num_channels % g == 0:
+                    return g
+            return 1  # Fallback to 1 group
+
+        # Build encoder through downsampling
+        for feature in reversed(features):
+            ch_count = feature
+            num_groups = get_num_groups(ch_count)
+
             self.downs.append(nn.Sequential(
                 nn.Conv2d(in_channels, feature, 3, padding=1),
+                nn.GroupNorm(num_groups, feature),
                 nn.ReLU(),
                 nn.Conv2d(feature, feature, 3, padding=1),
+                nn.GroupNorm(num_groups, feature),
                 nn.ReLU(),
             ))
+
             in_channels = feature
-        
-        # Up sampling
-        for feature in reversed(features):
+
+        # Bottleneck (middle block)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels * 2, kernel_size=3, padding=1),
+            nn.GroupNorm(get_num_groups(in_channels * 2), in_channels * 2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(get_num_groups(in_channels), in_channels),
+            nn.ReLU(),
+        )
+
+        # Build the upsampling blocks
+        for feature in features:
+            ch_count = feature
+            num_groups = get_num_groups(ch_count)
+
             self.ups.append(nn.Sequential(
-                nn.Conv2d(in_channels, feature, 3, padding=1),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+                nn.Conv2d(feature * 2, feature, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, feature),
                 nn.ReLU(),
-                nn.Conv2d(feature, feature, 3, padding=1),
+                nn.Conv2d(feature, feature, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, feature),
                 nn.ReLU(),
             ))
+
             in_channels = feature
 
         self.final = nn.Conv2d(in_channels, out_channels, 1)
+
 
     def load(self, resolution):
         transform = transforms.Compose([
@@ -113,24 +145,80 @@ class snowDiffusor(nn.Module):
         ])
 
         dataset = ImageFolder(root = self.data_directory, transform = transform)
-        dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
+        dataloader = DataLoader(dataset, 
+                                batch_size=4,
+                                shuffle=True, 
+                                num_workers=0) # Set workers to 0 due to weird M2 MPS behavior
         return dataloader
 
     def forward(self, x, t):
-        skip_connections = []
+        skips = []  # Save features for skip connections
+        device = torch.device("mps")  # Use MPS device
+
+        # Downsample through the encoder
         for down in self.downs:
             x = down(x)
-            skip_connections.append(x)
-            x = F.avg_pool2d(x, 2)
+            x.to(device)
+            skips.append(x)
 
-        for up in self.ups:
-            x = F.interpolate(x, scale_factor = 2, mode = 'nearest')
-            skip_x = skip_connections.pop()
-            
-            x = torch.cat((x, skip_x), dim=1)
-            x = up(x)
+        # Bottleneck (middle block)
+        x = self.bottleneck(x)
+        x.to(device)
+        print(f"Bottleneck output shape: {x.shape}")
+        
 
-        return self.final(x)
+        # Decode (Upsampling with skip connections)
+        for idx in range(len(self.ups)):
+            skip_connection = skips[-(idx + 1)]  # Get corresponding skip
+            print(f"Skip connection {idx} shape: {skip_connection.shape}")
+            print(f"x.device: {x.device}, skip_connection.device: {skip_connection.device}")
+
+            # Resize skip_connection to match the spatial dimensions of x
+            if x.shape[2:] != skip_connection.shape[2:]:
+                skip_connection = F.interpolate(skip_connection, size=x.shape[2:], mode="bilinear", align_corners=False)
+
+            # Ensure skip_connection channels match x's channels
+            if skip_connection.shape[1] != x.shape[1]:
+                skip_connection = self.adjust_skip_channels(skip_connection, x)
+
+            # Concatenate skip connection with x
+            x = torch.cat((x, skip_connection), dim=1)
+            x.to(device)
+            print(f"After concatenation: {x.shape}")
+
+            # Apply upsampling block
+            print(f"Before upsampling, x shape: {x.shape}")
+            x = self.ups[idx](x)
+            x.to(device)
+            print(f"After upsampling, x shape: {x.shape}")
+
+            # Before applying the next convolution layer, adjust channels if necessary
+            x = self.adjust_channels_after_upsample(x, required_channels = 16)
+            x.to(device)
+
+        # Final output layer
+        x = self.final(x)
+        x.to(device)
+        return 
+
+    def adjust_skip_channels(self, skip_connection, x):
+        device = x.device
+        skip_connection = skip_connection.to(device)  # Ensure skip_connection is on the same device as x
+        
+        # Check the number of channels and adjust if necessary
+        if skip_connection.shape[1] != x.shape[1]:
+            print(f"Adjusting channels from {skip_connection.shape[1]} to {x.shape[1]}")
+            # Use a 1x1 convolution to adjust channels
+            skip_connection = nn.Conv2d(skip_connection.shape[1], x.shape[1], kernel_size=1).to(device)(skip_connection)
+        
+        return skip_connection
+    
+    def adjust_channels_after_upsample(self, x, required_channels):
+        if x.shape[1] != required_channels:
+            print(f"Adjusting channels from {x.shape[1]} to {required_channels}")
+            # Apply a 1x1 convolution to adjust the number of channels
+            x = nn.Conv2d(x.shape[1], required_channels, kernel_size=1)(x)
+        return x
         
     def linear_beta_schedule(self, timesteps):
         beta_start = 0.0001
@@ -149,48 +237,66 @@ class snowDiffusor(nn.Module):
         sqrt_one_minus_alphas_cumprod_t = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None, None]
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def train_model(self, device = 'cuda'):
+    def train_model(self, _device = None):
+
+        if _device is None:
+            _device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        
+        self.to(_device)  # Move model to the chosen device
+        torch.autocast(_device)
         self.train()  # set model to training mode
-        scaler = torch.cuda.amp.GradScaler()
+        
+        # Disable GradScaler/autocast unless CUDA is available
+        use_amp = torch.cuda.is_available()
+
+        if use_amp: # if CUDA available
+            scaler = torch.cuda.amp.GradScaler() # Set up CUDA scaler
 
         for epoch in range(self.epochs):
             for batch in self.dataloader:
                 x, _ = batch  # if using ImageFolder, this returns (image, label)
-                x = x.to(device)
-                t = torch.randint(0, self.t, (x.size(0), ), device = device).long()
+                x = x.to(_device)
+                t = torch.randint(0, self.t, (x.size(0), ), device = _device).long()
                 noise = torch.randn_like(x)
                 x_noisy = self.q_sample(x, t, noise)
 
-                with torch.cuda.amp.autocast():
-                    noise_pred = self(x_noisy, t)  # 🔥 use self for forward pass
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        noise_pred = self(x_noisy, t)
+                        loss = F.mse_loss(noise_pred, noise)
+
+                    self.optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    noise_pred = self(x_noisy, t)
                     loss = F.mse_loss(noise_pred, noise)
 
-                self.optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(self.optimizer)
-                scaler.update()
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
 
             print(f"[Epoch {epoch+1}/{self.epochs}] Loss: {loss.item():.4f}")
             self.loss.append(loss.item())
 
     @torch.no_grad()
-    def generate(self, batch_size=16, channels=3, device='cuda'):
+    def generate(self, batch_size=16, channels=3, _device='mps'):
         self.eval()
+        self.to(_device)
 
-        image_size = self.resolution
-
-        x = torch.randn((batch_size, channels, image_size, image_size)).to(device)
+        x = torch.randn((batch_size, channels, self.resolution[0], self.resolution[1])).to(_device)
 
         for t in reversed(range(self.t)):
-            t_batch = torch.full((batch_size,), t, dtype = torch.long, device=device)
+            t_batch = torch.full((batch_size,), t, dtype = torch.long, device= _device)
 
             predicted_noise = self(x, t_batch)
 
-            beta_t = self.betas[t].to(device)
-            alpha_t = self.alphas[t].to(device)
-            alpha_cumprod_t = self.alphas_cumprod[t].to(device)
+            beta_t = self.betas[t].to(_device)
+            alpha_t = self.alphas[t].to(_device)
+            alpha_cumprod_t = self.alphas_cumprod[t].to(_device)
             alpha_cumprod_t_prev = (
-                self.alphas_cumprod[t - 1].to(device) if t > 0 else torch.tensor(1.0, device = device)
+                self.alphas_cumprod[t - 1].to(_device) if t > 0 else torch.tensor(1.0, device = _device)
             )
 
             coef1 = (1 / torch.sqrt(alpha_t)) * (
